@@ -33,22 +33,73 @@ function Spinner(){return <span className="spin"><LoaderCircle size={17}/></span
 
 function App(){
   const demoRef=useRef(null);
-  const [session,setSession]=useState(null),[data,setData]=useState(null),[page,setPage]=useState('dashboard'),[query,setQuery]=useState(''),[category,setCategory]=useState('すべて'),[personColumn,setPersonColumn]=useState(''),[operator,setOperator]=useState(localStorage.getItem('equipment-manager-operator')||''),[modal,setModal]=useState(null),[busy,setBusy]=useState(false),[syncing,setSyncing]=useState(false),[toast,setToast]=useState(null),[sideOpen,setSideOpen]=useState(false),[lastError,setLastError]=useState('');
+  const revisionRef=useRef(null);
+  const busyRef=useRef(false);
+  const refreshSeq=useRef(0);
+  const pendingRevisionRef=useRef(null);
+  const [peopleMode,setPeopleMode]=useState('selected'),[personQuery,setPersonQuery]=useState(''),[session,setSession]=useState(null),[data,setData]=useState(null),[page,setPage]=useState('dashboard'),[query,setQuery]=useState(''),[category,setCategory]=useState('すべて'),[personColumn,setPersonColumn]=useState(''),[operator,setOperator]=useState(localStorage.getItem('equipment-manager-operator')||''),[modal,setModal]=useState(null),[busy,setBusy]=useState(false),[syncing,setSyncing]=useState(false),[toast,setToast]=useState(null),[sideOpen,setSideOpen]=useState(false),[lastError,setLastError]=useState('');
   const notify=(text,kind='ok')=>{setToast({text,kind,key:Date.now()})};
   useEffect(()=>{if(!toast)return;const h=setTimeout(()=>setToast(null),5200);return()=>clearTimeout(h)},[toast]);
-  const refresh=useCallback(async({silent=false,mode=null}={})=>{
+  useEffect(()=>{busyRef.current=busy},[busy]);
+  const refresh=useCallback(async({silent=false}={})=>{
+    const seq=++refreshSeq.current;
     if(!silent)setSyncing(true);
     try{
       const s=await request('/api/snapshot');
+      // A slower earlier fetch must not overwrite a more recent snapshot.
+      if(seq!==refreshSeq.current)return;
+      revisionRef.current=s.revision??null;
       if(s.mode==='demo'){
         const saved=readDemo();const next=saved?.rows?.length?{...s,...saved,syncedAt:new Date().toISOString()}:s;demoRef.current=next;setData(next);
       }else setData(s);
       setLastError('');
-    }catch(err){setLastError(err.message);if(!silent)notify(err.message,'err');}
-    finally{setSyncing(false)}
+    }catch(err){if(seq===refreshSeq.current){setLastError(err.message);if(!silent)notify(err.message,'err');}}
+    finally{if(seq===refreshSeq.current)setSyncing(false)}
   },[]);
   useEffect(()=>{let alive=true;(async()=>{try{const s=await request('/api/session');if(!alive)return;setSession(s);if(s.authorized)await refresh({silent:true})}catch(err){if(alive){setSession({mode:'error',authorized:false});setLastError(err.message)}}})();return()=>{alive=false}},[refresh]);
-  useEffect(()=>{if(!session?.authorized||session.mode==='demo')return;const timer=setInterval(()=>{if(!busy&&!document.hidden)refresh({silent:true})},30000);const onFocus=()=>{if(!busy)refresh({silent:true})};window.addEventListener('focus',onFocus);return()=>{clearInterval(timer);window.removeEventListener('focus',onFocus)}},[session?.authorized,session?.mode,busy,refresh]);
+  // Only read Google Sheets on initial opening, actual edits, a webhook push,
+  // or an explicit manual reload. A reconnect with an unchanged revision reads nothing.
+  useEffect(()=>{
+    if(!session?.authorized||session.mode==='demo'||!data)return;
+    let disposed=false, socket=null, retryTimer=null, debounceTimer=null, failures=0;
+    const scheduleRefresh=(version)=>{
+      if(version===revisionRef.current)return;
+      pendingRevisionRef.current=version;
+      if(document.hidden||busyRef.current)return;
+      clearTimeout(debounceTimer);
+      debounceTimer=setTimeout(()=>{
+        if(disposed||document.hidden||busyRef.current)return;
+        pendingRevisionRef.current=null;
+        refresh({silent:true});
+      },400);
+    };
+    const reconnect=()=>{
+      if(disposed)return;
+      const url=new URL('/api/events',window.location.href);
+      url.protocol=url.protocol==='https:'?'wss:':'ws:';
+      socket=new WebSocket(url.href);
+      socket.onopen=()=>{failures=0};
+      socket.onmessage=({data:raw})=>{
+        try {const msg=JSON.parse(raw);if(['hello','changed'].includes(msg.type)&&typeof msg.revision==='string')scheduleRefresh(msg.revision);} catch {}
+      };
+      socket.onerror=()=>{try{socket.close()}catch{}};
+      socket.onclose=()=>{
+        // No Google Sheets requests while disconnected. Retry socket only.
+        if(!disposed&&failures<5) retryTimer=setTimeout(reconnect,Math.min(60000,1000*2**failures++));
+      };
+    };
+    const onVisible=()=>{if(!document.hidden&&pendingRevisionRef.current!==null)scheduleRefresh(pendingRevisionRef.current)};
+    reconnect();
+    document.addEventListener('visibilitychange',onVisible);
+    return()=>{disposed=true;clearTimeout(retryTimer);clearTimeout(debounceTimer);document.removeEventListener('visibilitychange',onVisible);if(socket)socket.close()};
+  },[session?.authorized,session?.mode,Boolean(data),refresh]);
+  useEffect(()=>{
+    if(!busy&&pendingRevisionRef.current!==null&&!document.hidden){
+      const version=pendingRevisionRef.current;
+      if(version!==revisionRef.current){pendingRevisionRef.current=null;refresh({silent:true})}
+      else pendingRevisionRef.current=null;
+    }
+  },[busy,refresh]);
   const rows=data?.rows||[],people=data?.people||[],history=data?.history||[];
   const categories=useMemo(()=>['すべて',...new Set(rows.map(r=>r.category).filter(Boolean))],[rows]);
   const availablePeople=useMemo(()=>people.filter(p=>p.name),[people]);
@@ -82,12 +133,45 @@ function App(){
     const out=await request('/api/edit',{method:'POST',body:JSON.stringify(input)});
     if(out.warning)notify(out.warning,'err');return out;
   };
-  const changeAllocation=async(row,p,change)=>{
+  // An allocation is a STOCK TRANSFER, not a stand-alone person-cell edit:
+  // person increases => G warehouse count decreases, and vice versa.
+  const changeAllocation=async(row,p,delta,closeAfter=false)=>{
     if(!ensureOperator()||busy)return;
-    const next=Math.max(0,itemCount(row,p)+change);
-    if(next===itemCount(row,p))return;
+    if(!Number.isSafeInteger(delta)||delta===0)return;
+    const assigned=itemCount(row,p), spares=count(row.spares);
+    if(delta>spares){notify(`備品が不足しています（残り${spares}点）。`,'err');return}
+    if(-delta>assigned){notify(`返却できるのは${assigned}点までです。`,'err');return}
     setBusy(true);
-    try{await doEdit({row,column:p.column,value:next===0?'':String(next),reason:change>0?'貸出・割当':'返却・割当解除'});if(session.mode!=='demo')await refresh({silent:true});notify(`${p.name}さんの「${row.name}」を${change>0?'追加':'返却'}しました`)}catch(e){notify(e.message,'err');if(e.status===409)await refresh({silent:true})}finally{setBusy(false)}
+    try{
+      if(session.mode==='demo'){
+        const current=demoRef.current||data;
+        const next={...current,rows:current.rows.map(r=>{
+          if(r.sheetRow!==row.sheetRow)return r;
+          const x={...r,allocations:{...r.allocations}};
+          const nextAssigned=assigned+delta, nextSpares=spares-delta;
+          if(nextAssigned)x.allocations[p.column]=String(nextAssigned);
+          else delete x.allocations[p.column];
+          x.spares=String(nextSpares);
+          x.active=String(getPeopleCount(x));
+          x.total=String(count(x.active)+nextSpares);
+          return x;
+        }),history:[{time:new Date().toISOString(),actor:currentOperator.name,action:delta>0?'貸出・割当':'返却・在庫戻し',sheetRow:row.sheetRow,asset:row.name,person:p.name,before:String(assigned),after:String(assigned+delta),detail:`備品数 ${spares} → ${spares-delta}`} ,...current.history].slice(0,150)};
+        updateDemo(next);
+      }else{
+        const out=await request('/api/allocation',{method:'POST',body:JSON.stringify({
+          sheetRow:row.sheetRow, personColumn:p.column, delta,
+          expectedName:row.name,expectedPersonName:p.name,
+          expectedAssigned:String(row.allocations?.[p.column]??''),
+          expectedSpares:String(row.spares??''),
+          actor:currentOperator.name
+        })});
+        if(out.warning)notify(out.warning,'err');
+        await refresh({silent:true});
+      }
+      if(closeAfter)setModal(null);
+      notify(`${p.name}さんの「${row.name}」を${Math.abs(delta)}点${delta>0?'割り当て':'返却'}しました`);
+    }catch(e){notify(e.message,'err');if(session.mode!=='demo'&&e.status===409)await refresh({silent:true})}
+    finally{setBusy(false)}
   };
   const saveItem=async(row,fields)=>{
     if(!ensureOperator()||busy)return;
@@ -116,21 +200,31 @@ function App(){
   if(!session)return <div className="center-screen"><Spinner/> <span>読み込み中...</span></div>;
   if(!session.authorized)return <div className="auth-page"><div className="auth-mark"><Boxes size={30}/></div><div className="auth-panel"><div className="auth-heading"><div className="eyebrow">EQUIPMENT DESK</div><h1>事務所の機材を、<br/>ひとつの場所で。</h1><p>Google スプレッドシートを原本にした機材管理システム</p></div><div className="notice error"><CircleAlert size={20}/><div><strong>初期設定が必要です</strong><p>{session.missing||lastError||'Cloudflare の接続設定を確認してください。'}<br/>SERVICE_ACCOUNT_EMAIL / SERVICE_ACCOUNT_PRIVATE_KEY / SPREADSHEET_ID を確認してください。</p></div></div><p className="auth-bottom"><ShieldCheck size={15}/> Google の認証キーはサーバー側で保護されます</p></div></div>;
   return <div className="app-shell">
-    <aside className={'sidebar'+(sideOpen?' show':'')}><div className="brand"><div className="brand-icon"><Boxes size={22}/></div><div><strong>機材管理</strong><small>EQUIPMENT DESK</small></div></div><div className="sidebar-label">WORKSPACE</div><nav>{nav.map(n=><button key={n.id} className={'nav-link'+(page===n.id?' active':'')} onClick={()=>switchPage(n.id)}><n.icon size={19}/><span>{n.label}</span>{page===n.id&&<span className="nav-indicator"/>}</button>)}</nav><div className="side-spacer"/><div className="side-bottom"><div className="source-panel"><div className="source-logo"><FileSpreadsheet size={21}/></div><div><strong>Google Sheets連携</strong><small>{session.mode==='demo'?'デモデータを表示中':'原本と双方向で同期'}</small></div><span className={'status-dot'+(lastError?' offline':'')}/></div><div className="source-hint">{session.mode==='demo'?'編集内容はこのブラウザに保存されます。':'変更は原本へ保存。外部の変更は30秒ごとに取得します。'}</div></div></aside>
+    <aside className={'sidebar'+(sideOpen?' show':'')}><div className="brand"><div className="brand-icon"><Boxes size={22}/></div><div><strong>機材管理</strong><small>EQUIPMENT DESK</small></div></div><div className="sidebar-label">WORKSPACE</div><nav>{nav.map(n=><button key={n.id} className={'nav-link'+(page===n.id?' active':'')} onClick={()=>switchPage(n.id)}><n.icon size={19}/><span>{n.label}</span>{page===n.id&&<span className="nav-indicator"/>}</button>)}</nav><div className="side-spacer"/><div className="side-bottom"><div className="source-panel"><div className="source-logo"><FileSpreadsheet size={21}/></div><div><strong>Google Sheets連携</strong><small>{session.mode==='demo'?'デモデータを表示中':'原本と双方向で同期'}</small></div><span className={'status-dot'+(lastError?' offline':'')}/></div><div className="source-hint">{session.mode==='demo'?'編集内容はこのブラウザに保存されます。':'変更は原本へ保存。外部の変更は通知を受けて取得します。定期取得は行いません。'}</div></div></aside>
     {sideOpen&&<div className="mobile-backdrop" onClick={()=>setSideOpen(false)}/>}
     <div className="main-area"><header className="topbar"><div className="topbar-left"><IconButton icon={Menu} title="メニュー" onClick={()=>setSideOpen(true)}/><div className="breadcrumb">ワークスペース <ChevronRight size={14}/> <strong>{nav.find(n=>n.id===page)?.label}</strong></div></div><div className="topbar-right"><div className={'connection'+(lastError?' error-connection':'')}><span className="status-dot"/>{session.mode==='demo'?'デモモード':lastError?'同期エラー':syncing?'同期中':'同期済み'}</div><div className="operator"><UserRound size={17}/><select aria-label="操作する人" value={operator} onChange={e=>setOperatorPersist(e.target.value)}><option value="">操作する人を選択</option>{people.map(p=><option key={p.column} value={p.column}>{p.name}</option>)}</select><ChevronDown size={14}/></div><IconButton icon={RefreshCw} title="最新の状態に更新" onClick={()=>refresh()} disabled={syncing}/></div></header>
-    <main className="content"><div className="page-top"><div><div className="eyebrow">EQUIPMENT MANAGEMENT <span className="eyebrow-line"/></div><h1>{page==='dashboard'?'機材管理 ダッシュボード':page==='assets'?'機材一覧':page==='people'?'個人別の使用状況':'変更履歴'}</h1><p>{page==='dashboard'?'事務所全体の保有機材と使用状況を確認できます。':page==='assets'?'機材の情報と貸出状況をまとめて管理します。':page==='people'?'スタッフごとの機材の割当状況を確認・更新します。':'Webから行われた操作を記録しています。'}</p></div><div className="page-actions">{data?.sheetUrl&&<a className="button light" href={data.sheetUrl} target="_blank" rel="noreferrer"><FileSpreadsheet size={16}/> スプシを開く <ExternalLink size={13}/></a>}{page==='assets'&&<button className="button primary" onClick={()=>setModal({kind:'create'})}><Plus size={17}/> 機材を追加</button>}{page==='dashboard'&&<button className="button primary" onClick={()=>switchPage('assets')}><Boxes size={17}/> 機材一覧を見る</button>}</div></div>
+    <main className="content"><div className="page-top"><div><div className="eyebrow">EQUIPMENT MANAGEMENT <span className="eyebrow-line"/></div><h1>{page==='dashboard'?'機材管理 ダッシュボード':page==='assets'?'機材一覧':page==='people'?'個人別の使用状況':'変更履歴'}</h1><p>{page==='dashboard'?'事務所全体の保有機材と使用状況を確認できます。':page==='assets'?'機材の登録情報・稼働数・保管在庫を管理します。':page==='people'?'スタッフごとの機材の割当状況を確認・更新します。':'Webから行われた操作を記録しています。'}</p></div><div className="page-actions">{data?.sheetUrl&&<a className="button light" href={data.sheetUrl} target="_blank" rel="noreferrer"><FileSpreadsheet size={16}/> スプシを開く <ExternalLink size={13}/></a>}{page==='assets'&&<button className="button primary" onClick={()=>setModal({kind:'create'})}><Plus size={17}/> 機材を追加</button>}{page==='dashboard'&&<button className="button primary" onClick={()=>switchPage('assets')}><Boxes size={17}/> 機材一覧を見る</button>}</div></div>
     {session.mode==='demo'&&<div className="demo-banner"><CircleAlert size={16}/> これはサンプルデータです。実際のスプシと双方向接続するには README に従って設定してください。</div>}
     {lastError&&<div className="notice error"><CloudOff size={18}/><div><strong>スプレッドシートの更新を取得できませんでした。</strong><p>{lastError}（直前の表示を維持しています）</p></div><button className="text-link" onClick={()=>refresh()}>再試行</button></div>}
-    {page==='dashboard'&&<Dashboard summary={summary} rows={rows} people={people} history={history} onNavigate={switchPage} onSelectPerson={col=>{setPersonColumn(col);switchPage('people')}}/>}
-    {page==='assets'&&<><div className="toolbar"><div className="search"><Search size={18}/><input aria-label="機材を検索" placeholder="機材名、型番、備考で検索..." value={query} onChange={e=>setQuery(e.target.value)}/>{query&&<button title="検索を消去" onClick={()=>setQuery('')}><X size={16}/></button>}</div><div className="category-select"><Filter size={15}/><select value={category} onChange={e=>setCategory(e.target.value)}>{categories.map(c=><option key={c}>{c}</option>)}</select><ChevronDown size={14}/></div><span className="result-count">{filteredRows.length} 件の機材</span></div><div className="table-wrap"><table className="asset-table"><thead><tr><th>機材情報</th><th>カテゴリ</th><th className="num">稼働</th><th className="num">備品</th><th className="num">総数</th><th>個人への割当</th><th className="right">操作</th></tr></thead><tbody>{filteredRows.map(r=><tr key={r.sheetRow}><td><div className="asset-cell"><span className="equipment-icon"><Monitor size={19}/></span><div><strong>{r.name}</strong><small>{r.model||'型番未登録'}</small></div></div></td><td><Tag color={r.category==='作業環境'?'blue':r.category==='周辺機器'?'purple':'neutral'}>{r.category||'未分類'}</Tag></td><td className="num"><b>{r.active===''?'—':r.active}</b></td><td className="num"><b>{r.spares===''?'—':r.spares}</b></td><td className="num"><b>{r.total===''?'—':r.total}</b></td><td><div className="assignment-cell">{people.filter(p=>itemCount(r,p)>0).slice(0,3).map(p=><span key={p.column} className="person-avatar" title={`${p.name}：${itemCount(r,p)}`}>{p.name.slice(0,1)}</span>)}{people.filter(p=>itemCount(r,p)>0).length>3&&<span className="avatar-more">+{people.filter(p=>itemCount(r,p)>0).length-3}</span>}{!people.some(p=>itemCount(r,p)>0)&&<span className="muted">未割当</span>}<span className="assignment-count">{people.filter(p=>itemCount(r,p)>0).length} 人</span></div></td><td className="right"><div className="row-actions"><button className="small-button" onClick={()=>setModal({kind:'assign',row:r})}><Plus size={15}/> 割当</button><button className="small-button subtle" onClick={()=>setModal({kind:'edit',row:r})}>編集 <ChevronRight size={14}/></button></div></td></tr>)}</tbody></table>{filteredRows.length===0&&<Blank icon={Search} title="該当する機材がありません" description="検索条件を変更してください。"/>}</div><p className="table-foot"><ShieldCheck size={15}/>「稼働」「総数」はスプレッドシートの自動計算結果を表示します。Web側で直接書き換えません。</p></>}
-    {page==='people'&&<><div className="people-choices">{people.map(p=>{const owned=rows.filter(r=>itemCount(r,p)>0);const qty=owned.reduce((n,r)=>n+itemCount(r,p),0);return <button key={p.column} className={'person-choice'+(selectedPerson?.column===p.column?' selected':'')} onClick={()=>setPersonColumn(p.column)}><span className="person-initial">{p.name.slice(0,1)}</span><span className="person-choice-text"><strong>{p.name}</strong><small>{owned.length}種類 · {qty}点</small></span><ChevronRight size={17}/></button>})}</div>{selectedPerson?<PersonDetail person={selectedPerson} rows={rows} busy={busy} onChange={changeAllocation} onAssign={r=>setModal({kind:'assign',row:r,defaultPerson:selectedPerson.column})}/>:<Blank icon={UsersRound} title="担当者が登録されていません" description="スプシの2行目、K列以降の見出しを確認してください。"/>}</>}
+    {page==='dashboard'&&<Dashboard summary={summary} rows={rows} people={people} history={history} onNavigate={switchPage} onSelectPerson={col=>{setPersonColumn(col);setPeopleMode('selected');switchPage('people')}}/>}
+    {page==='assets'&&<><div className="toolbar"><div className="search"><Search size={18}/><input aria-label="機材を検索" placeholder="機材名、型番、備考で検索..." value={query} onChange={e=>setQuery(e.target.value)}/>{query&&<button title="検索を消去" onClick={()=>setQuery('')}><X size={16}/></button>}</div><div className="category-select"><Filter size={15}/><select value={category} onChange={e=>setCategory(e.target.value)}>{categories.map(c=><option key={c}>{c}</option>)}</select><ChevronDown size={14}/></div><span className="result-count">{filteredRows.length} 件の機材</span></div><div className="table-wrap"><table className="asset-table"><thead><tr><th>機材情報</th><th>カテゴリ</th><th className="num">稼働</th><th className="num">備品</th><th className="num">総数</th><th className="right">操作</th></tr></thead><tbody>{filteredRows.map(r=><tr key={r.sheetRow}><td><div className="asset-cell"><span className="equipment-icon"><Monitor size={19}/></span><div><strong>{r.name}</strong><small>{r.model||'型番未登録'}</small></div></div></td><td><Tag color={r.category==='作業環境'?'blue':r.category==='周辺機器'?'purple':'neutral'}>{r.category||'未分類'}</Tag></td><td className="num"><b>{r.active===''?'—':r.active}</b></td><td className="num"><b>{r.spares===''?'—':r.spares}</b></td><td className="num"><b>{r.total===''?'—':r.total}</b></td><td className="right"><div className="row-actions"><button className="small-button subtle" onClick={()=>setModal({kind:'edit',row:r})}>編集 <ChevronRight size={14}/></button></div></td></tr>)}</tbody></table>{filteredRows.length===0&&<Blank icon={Search} title="該当する機材がありません" description="検索条件を変更してください。"/>}</div><p className="table-foot"><ShieldCheck size={15}/>「稼働」「総数」はスプレッドシートの自動計算結果です。割当・返却は「個人別の使用状況」から操作できます。</p></>}
+    {page==='people'&&<>
+      <div className="people-toolbar">
+        <div className="people-toolbar-left">
+          <label className="person-picker-label" htmlFor="person-selector">スタッフを選択</label>
+          <div className="person-picker-control"><UsersRound size={17}/><select id="person-selector" value={selectedPerson?.column||''} onChange={e=>{setPersonColumn(e.target.value);setPeopleMode('selected')}}>{availablePeople.map(p=><option key={p.column} value={p.column}>{p.name}</option>)}</select><ChevronDown size={16}/></div>
+          <span className="people-roster-count">{availablePeople.length} 名登録</span>
+        </div>
+        <div className="segmented people-display-mode"><button className={peopleMode==='selected'?'on':''} onClick={()=>setPeopleMode('selected')}><UserRound size={15}/> 選択したスタッフ</button><button className={peopleMode==='all'?'on':''} onClick={()=>setPeopleMode('all')}><UsersRound size={15}/> 全員一覧</button></div>
+      </div>
+      {peopleMode==='selected'&&selectedPerson?<PersonDetail person={selectedPerson} rows={rows} busy={busy} onChange={changeAllocation} onAssign={()=>setModal({kind:'allocate',personColumn:selectedPerson.column})}/>:peopleMode==='all'?<PeopleOverview rows={rows} people={availablePeople} query={personQuery} onQueryChange={setPersonQuery} onSelect={col=>{setPersonColumn(col);setPeopleMode('selected')}}/>:<Blank icon={UsersRound} title="担当者が登録されていません" description="スプシの2行目、K列以降の見出しを確認してください。"/>}
+    </>}
     {page==='history'&&<><div className="history-heading"><div><h3>操作ログ</h3><p>Webで行った編集・割当操作を表示します。スプシで直接編集した操作はGoogle側の変更履歴で確認してください。</p></div><Pill>最新 {history.length} 件</Pill></div><div className="history-list">{history.length?history.map((h,i)=><div className="history-row" key={i}><span className="history-bullet"><History size={17}/></span><div className="history-main"><div><strong>{h.asset}</strong><span className="history-action">{h.action}</span></div><p>{h.person?`${h.person} · `:''}{h.before||'空欄'} <ArrowRight size={13}/> {h.after||'空欄'}</p></div><div className="history-meta"><strong>{h.actor||'未指定'}</strong><small>{dateTime(h.time)}</small></div></div>):<Blank icon={History} title="変更履歴はまだありません" description="Webで編集すると、操作内容が記録されます。"/>}</div></>}
-    <footer className="content-footer"><span><span className={'status-dot'+(lastError?' offline':'')}/> {session.mode==='demo'?'デモデータ':'Google Sheetsと接続'} · {data?.syncedAt?`最終取得 ${dateTime(data.syncedAt)}`:'未取得'}</span><span>30秒ごとに自動更新 · 手動更新も可能</span></footer>
+    <footer className="content-footer"><span><span className={'status-dot'+(lastError?' offline':'')}/> {session.mode==='demo'?'デモデータ':'Google Sheetsと接続'} · {data?.syncedAt?`最終取得 ${dateTime(data.syncedAt)}`:'未取得'}</span><span>変更通知で更新 · 定期取得なし · 手動更新可能</span></footer>
     </main></div>
     {modal?.kind==='edit'&&<EditModal row={modal.row} busy={busy} onClose={()=>!busy&&setModal(null)} onSave={values=>saveItem(modal.row,values)}/>}
     {modal?.kind==='create'&&<CreateModal categories={categories.filter(c=>c!=='すべて')} busy={busy} onClose={()=>!busy&&setModal(null)} onSave={createItem}/>}
-    {modal?.kind==='assign'&&<AssignModal row={rows.find(r=>r.sheetRow===modal.row.sheetRow)||modal.row} people={people} defaultPerson={modal.defaultPerson||operator||people[0]?.column} busy={busy} onClose={()=>setModal(null)} onChange={changeAllocation}/>}
+    {modal?.kind==='allocate'&&<AssignToPersonModal person={people.find(p=>p.column===modal.personColumn)} rows={rows} busy={busy} onClose={()=>!busy&&setModal(null)} onSubmit={(row,p,amount)=>changeAllocation(row,p,amount,true)}/>}
     {toast&&<div key={toast.key} className={'toast '+(toast.kind==='err'?'toast-error':'')}><span>{toast.kind==='err'?<CircleAlert size={18}/>:<CheckCircle2 size={18}/>}</span>{toast.text}<button onClick={()=>setToast(null)} aria-label="閉じる"><X size={15}/></button></div>}
   </div>
 }
@@ -143,10 +237,56 @@ function Dashboard({summary,rows,people,history,onNavigate,onSelectPerson}){
   return <><div className="stat-grid">{stats.map(s=><div className="stat-card" key={s.label}><div className="stat-first"><span>{s.label}</span><span className={'stat-icon '+s.kind}><s.icon size={21}/></span></div><div className="stat-value">{fmt(s.value)} <small>{s.unit}</small></div><p>{s.detail}</p></div>)}</div><div className="dash-grid"><section className="panel"><div className="panel-title"><div><h3>スタッフ別 使用状況</h3><p>現在の割当点数が多い順</p></div><button className="text-link" onClick={()=>onNavigate('people')}>すべて見る <ArrowRight size={15}/></button></div><div className="people-bars">{topPeople.length?topPeople.map((p,i)=><button key={p.column} className="people-bar" onClick={()=>onSelectPerson(p.column)}><span className="person-avatar large">{p.name.slice(0,1)}</span><span className="bar-body"><span className="bar-label"><strong>{p.name}</strong><small>{p.types}種類 / {p.qty}点</small></span><span className="bar-track"><span style={{width:`${Math.max(2,p.qty/max*100)}%`}}/></span></span></button>):<Blank icon={UsersRound} title="割当がありません" description="スタッフの列を設定してください。"/>}</div></section><section className="panel"><div className="panel-title"><div><h3>カテゴリ別 機材</h3><p>カテゴリごとの登録種類数</p></div><span className="mini-icon"><SlidersHorizontal size={18}/></span></div><div className="category-list">{cat.slice(0,7).map(([name,n],i)=><div className="category-row" key={name}><div className="category-name"><span className={'category-dot d'+(i%5)}/><strong>{name}</strong></div><div className="category-progress"><span style={{width:`${n/Math.max(rows.length,1)*100}%`}}/></div><span className="category-n">{n} 種類</span></div>)}{cat.length===0&&<Blank icon={Package} title="機材がありません" description="機材一覧から追加してください。"/>}</div><div className="panel-bottom">全 {rows.length} 種類を管理中</div></section></div><section className="panel recent-panel"><div className="panel-title"><div><h3>最近の操作</h3><p>Webで更新された内容</p></div><button className="text-link" onClick={()=>onNavigate('history')}>履歴を見る <ArrowRight size={15}/></button></div>{history.length?<div className="recent-list">{history.slice(0,4).map((h,i)=><div className="recent-row" key={i}><div className="recent-icon"><ClipboardList size={17}/></div><div><strong>{h.actor||'担当者'} <span>が「{h.asset}」を{h.action}</span></strong><p>{h.person||'備品情報'} · {h.before||'空欄'} → {h.after||'空欄'}</p></div><time>{dateTime(h.time)}</time></div>)}</div>:<Blank icon={History} title="操作履歴はまだありません" description="機材の編集や割当を行うとここに表示されます。"/>}</section></>
 }
 function PersonDetail({person,rows,busy,onChange,onAssign}){
-  const [filter,setFilter]=useState('assigned'),[term,setTerm]=useState('');
+  const [term,setTerm]=useState('');
   const assigned=rows.filter(r=>itemCount(r,person)>0);
-  const shown=rows.filter(r=>(filter==='all'||itemCount(r,person)>0)&&[r.name,r.model,r.category].join(' ').toLowerCase().includes(term.toLowerCase()));
-  return <div className="person-detail"><div className="person-summary"><span className="person-hero-avatar">{person.name.slice(0,1)}</span><div><h2>{person.name} <small>さんの機材</small></h2><p>現在割り当てられている機材を管理できます。</p></div><div className="person-total"><strong>{assigned.reduce((n,r)=>n+itemCount(r,person),0)}</strong><span>合計点数</span></div><div className="person-total"><strong>{assigned.length}</strong><span>機材の種類</span></div></div><div className="person-tools"><div className="segmented"><button className={filter==='assigned'?'on':''} onClick={()=>setFilter('assigned')}>使用中 ({assigned.length})</button><button className={filter==='all'?'on':''} onClick={()=>setFilter('all')}>すべての機材 ({rows.length})</button></div><div className="search person-search"><Search size={16}/><input value={term} onChange={e=>setTerm(e.target.value)} placeholder="機材を検索"/></div></div><div className="assigned-grid">{shown.map(r=><div className="assigned-card" key={r.sheetRow}><div className="assigned-main"><span className="equipment-icon"><Monitor size={19}/></span><div><strong>{r.name}</strong><small>{r.model||r.category||'機材'}</small></div></div><div className="quantity-row"><span>割当数</span><div className="stepper"><button aria-label={`${r.name}を1つ返却`} disabled={busy||itemCount(r,person)===0} onClick={()=>onChange(r,person,-1)}><Minus size={16}/></button><b>{itemCount(r,person)}</b><button aria-label={`${r.name}を1つ割当`} disabled={busy} onClick={()=>onChange(r,person,1)}><Plus size={16}/></button></div></div></div>)}</div>{shown.length===0&&<Blank icon={Package} title="機材が見つかりません" description="「すべての機材」を選択すると、新たに割り当てられます。"/>}</div>
+  const shown=assigned.filter(r=>[r.name,r.model,r.category].join(' ').toLowerCase().includes(term.toLowerCase()));
+  const qty=assigned.reduce((n,r)=>n+itemCount(r,person),0);
+  return <div className="person-workspace">
+    <section className="person-summary compact-person-summary">
+      <span className="person-hero-avatar">{person.name.slice(0,1)}</span>
+      <div className="person-summary-title"><h2>{person.name} <small>さんの使用機材</small></h2><p>スプレッドシート上の個人列と同期しています</p></div>
+      <div className="person-total"><strong>{assigned.length}</strong><span>種類</span></div>
+      <div className="person-total"><strong>{qty}</strong><span>使用点数</span></div>
+      <button className="button primary assign-person-button" onClick={onAssign} disabled={busy}><Plus size={17}/> 機材を割り当て</button>
+    </section>
+    <section className="person-list-panel">
+      <div className="person-list-heading"><div><h3>現在使用している機材</h3><p>＋で追加割当、－で返却します。備品数も同時に更新されます。</p></div><div className="search small-search"><Search size={16}/><input value={term} onChange={e=>setTerm(e.target.value)} placeholder="使用中の機材を検索"/></div></div>
+      <div className="person-assets-list"><div className="person-assets-head"><span>機材情報</span><span>備品（残数）</span><span>個人使用数・操作</span></div>
+      {shown.map(r=><div className="person-asset-row" key={r.sheetRow}>
+        <div className="person-asset-main"><span className="equipment-icon"><Monitor size={18}/></span><div><strong>{r.name}</strong><small>{r.model||r.category||'型番未登録'}</small></div></div>
+        <div className="person-stock-cell"><span className={'stock-chip'+(count(r.spares)===0?' empty':'')}>{count(r.spares)} 点</span></div>
+        <div className="person-count-control"><span className="count-text">使用 {itemCount(r,person)} 点</span><div className="stepper"><button aria-label={`${r.name}を1点返却`} title="返却して備品数を1点増やす" disabled={busy||itemCount(r,person)===0} onClick={()=>onChange(r,person,-1)}><Minus size={16}/></button><b>{itemCount(r,person)}</b><button aria-label={`${r.name}を1点割当`} title="割り当てて備品数を1点減らす" disabled={busy||count(r.spares)===0} onClick={()=>onChange(r,person,1)}><Plus size={16}/></button></div></div>
+      </div>)}</div>
+      {shown.length===0&&<Blank icon={Package} title={assigned.length?'該当する機材がありません':'このスタッフの使用機材はありません'} description="「機材を割り当て」から保管中の機材を選択できます。"/>}
+    </section>
+  </div>
+}
+function PeopleOverview({rows,people,query,onQueryChange,onSelect}){
+  const results=people.filter(p=>p.name.toLowerCase().includes(query.toLowerCase()));
+  return <section className="roster-panel"><div className="roster-top"><div><h3>全員の機材使用状況</h3><p>使用機材を一覧で比較できます。スタッフを選択すると割当・返却ができます。</p></div><div className="search small-search"><Search size={16}/><input value={query} onChange={e=>onQueryChange(e.target.value)} placeholder="スタッフを検索"/></div></div><div className="roster-rows">
+    {results.map(p=>{const assigned=rows.filter(r=>itemCount(r,p)>0);const total=assigned.reduce((n,r)=>n+itemCount(r,p),0);return <button type="button" key={p.column} className="roster-row" onClick={()=>onSelect(p.column)}><span className="roster-identity"><span className="person-initial">{p.name.slice(0,1)}</span><strong>{p.name}</strong></span><span className="roster-chips">{assigned.slice(0,6).map(r=><span className="roster-chip" key={r.sheetRow}>{r.name} <b>×{itemCount(r,p)}</b></span>)}{assigned.length>6&&<span className="roster-more">ほか {assigned.length-6} 種類</span>}{!assigned.length&&<span className="muted">割当なし</span>}</span><span className="roster-totals">{assigned.length} 種類 <b>{total} 点</b></span><ChevronRight size={17}/></button>})}
+    {!results.length&&<Blank icon={Search} title="スタッフが見つかりません" description="検索条件を変更してください。"/>}
+  </div></section>
+}
+function AssignToPersonModal({person,rows,busy,onClose,onSubmit}){
+  const inStock=rows.filter(r=>count(r.spares)>0);
+  const [filter,setFilter]=useState('');
+  const [selected,setSelected]=useState(inStock[0]?.sheetRow||'');
+  const [quantity,setQuantity]=useState('1');
+  const filtered=inStock.filter(r=>[r.name,r.model,r.category].join(' ').toLowerCase().includes(filter.toLowerCase()));
+  const chosen=filtered.find(r=>String(r.sheetRow)===String(selected))||filtered[0];
+  const q=Number(quantity),stock=count(chosen?.spares);
+  const valid=chosen&&Number.isSafeInteger(q)&&q>=1&&q<=stock;
+  return <Modal title={`${person?.name||'スタッフ'}さんへ機材を割り当て`} subtitle="備品（G列）から移動し、使用数と在庫を同時に更新します。" onClose={onClose}>
+    <form className="edit-form" onSubmit={e=>{e.preventDefault();if(valid&&person)onSubmit(chosen,person,q)}}>
+      <label className="form-field"><span>機材を検索</span><input value={filter} onChange={e=>{setFilter(e.target.value);setSelected('')}} placeholder="機材名・型番・カテゴリ"/></label>
+      <label className="form-field"><span>割り当てる機材</span><select value={chosen?.sheetRow||''} onChange={e=>setSelected(e.target.value)} disabled={!filtered.length}>{filtered.map(r=><option key={r.sheetRow} value={r.sheetRow}>{r.name} {r.model?`／ ${r.model}`:''} （備品 {count(r.spares)}点）</option>)}</select></label>
+      <label className="form-field"><span>割当数量</span><input type="number" min="1" max={stock||1} step="1" value={quantity} onChange={e=>setQuantity(e.target.value)} required disabled={!chosen}/></label>
+      {chosen?<div className="allocation-preview"><div><small>現在の備品数</small><strong>{stock} 点</strong></div><ArrowRight size={18}/><div><small>割当後の備品数</small><strong>{valid?stock-q:'—'} 点</strong></div><div><small>{person?.name}さんの割当数</small><strong>{itemCount(chosen,person)+(valid?q:0)} 点</strong></div></div>:<div className="notice error">{inStock.length?'検索に該当する機材がありません。':'割当できる備品がありません。'}</div>}
+      <div className="modal-hint"><ShieldCheck size={16}/> 在庫が不足している場合や他の人が先に更新した場合は保存されません。</div>
+      <div className="modal-actions"><button type="button" className="button light" onClick={onClose} disabled={busy}>キャンセル</button><button type="submit" className="button primary" disabled={busy||!valid}>{busy?<Spinner/>:<Check size={16}/>} {valid?`${q}点を割り当て`:'数量を確認'}</button></div>
+    </form>
+  </Modal>
 }
 function EditModal({row,busy,onClose,onSave}){
   const [values,setValues]=useState(Object.fromEntries(FIELDS.map(([col])=>[FIELD_MAP[col],String(row[FIELD_MAP[col]]||'')])));
@@ -157,9 +297,4 @@ function CreateModal({categories,busy,onClose,onSave}){
   const [values,setValues]=useState({category:categories[0]||'作業環境',name:'',model:'',note:'',spares:'1',purchasedAt:'',lifespan:''});const set=(key,value)=>setValues(v=>({...v,[key]:value}));
   return <Modal title="新しい機材を追加" subtitle="スプレッドシートの最終データ行の下に登録します。" onClose={onClose}><form className="edit-form" onSubmit={e=>{e.preventDefault();onSave(values)}}><label className="form-field"><span>機材名 <span className="required">*</span></span><input autoFocus required value={values.name} onChange={e=>set('name',e.target.value)} placeholder="例：モニター"/></label><label className="form-field"><span>カテゴリ</span><input list="category-list" value={values.category} onChange={e=>set('category',e.target.value)} placeholder="作業環境"/><datalist id="category-list">{categories.map(c=><option key={c} value={c}/>)}</datalist></label><label className="form-field"><span>型番</span><input value={values.model} onChange={e=>set('model',e.target.value)} placeholder="製品・型番"/></label><label className="form-field"><span>備品数（保管分）</span><input type="number" min="0" required value={values.spares} onChange={e=>set('spares',e.target.value)}/></label><label className="form-field"><span>購入日</span><input value={values.purchasedAt} placeholder="YYYY/MM/DD" onChange={e=>set('purchasedAt',e.target.value)}/></label><label className="form-field"><span>耐用年数</span><input type="number" min="0" value={values.lifespan} onChange={e=>set('lifespan',e.target.value)}/></label><label className="form-field"><span>備考</span><textarea rows="2" value={values.note} onChange={e=>set('note',e.target.value)}/></label><div className="modal-hint"><CircleAlert size={16}/> 新規行では上の行の書式・入力規則・数式を引き継ぎます。原本の数式構成は事前に確認してください。</div><div className="modal-actions"><button type="button" className="button light" onClick={onClose} disabled={busy}>キャンセル</button><button type="submit" className="button primary" disabled={busy}>{busy?<Spinner/>:<Plus size={17}/>} 登録する</button></div></form></Modal>
 }
-function AssignModal({row,people,defaultPerson,busy,onClose,onChange}){
-  const [selected,setSelected]=useState(defaultPerson||people[0]?.column||'');const p=people.find(p=>p.column===selected)||people[0];
-  return <Modal title="機材の割当・返却" subtitle={`${row.name} ${row.model?`/ ${row.model}`:''}`} onClose={onClose}><div className="assign-info"><div><span>稼働</span><strong>{row.active||'—'}</strong></div><div><span>備品</span><strong>{row.spares||'—'}</strong></div><div><span>総数</span><strong>{row.total||'—'}</strong></div></div><label className="form-field assign-selector"><span>割当先のスタッフ</span><select value={selected} onChange={e=>setSelected(e.target.value)}>{people.map(x=><option key={x.column} value={x.column}>{x.name}</option>)}</select></label>{p&&<div className="assign-controls"><span className="person-avatar large">{p.name.slice(0,1)}</span><div className="assign-person"><strong>{p.name}</strong><small>現在の割当数 : {itemCount(row,p)}点</small></div><div className="stepper big"><button disabled={busy||!itemCount(row,p)} onClick={()=>onChange(row,p,-1)}><Minus size={18}/></button><b>{itemCount(row,p)}</b><button disabled={busy} onClick={()=>onChange(row,p,1)}><Plus size={18}/></button></div></div>}<p className="modal-note">＋で割当、－で返却（個人のセル値を更新）。備品数 G列は自動では増減しません。</p><div className="modal-actions"><button type="button" className="button light" onClick={onClose}>閉じる</button></div></Modal>
-}
-
 createRoot(document.getElementById('root')).render(<App/>);

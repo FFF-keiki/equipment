@@ -1,4 +1,4 @@
-import { asCount, colToIndex, indexToCol, normalizeCell, parseSheet, sheetRef, validateEdit } from './domain.js';
+import { asCount, colToIndex, indexToCol, normalizeCell, parseSheet, sheetRef, validateEdit, planAllocation } from './domain.js';
 
 const tokens = new Map();
 function base64url(bytes) {
@@ -98,6 +98,7 @@ export async function editCell(env, input) {
   const header = await getValues(env, sheetRef(c.SHEET_TAB, `A${c.HEADER_ROW}:${c.PERSON_END_COLUMN}${c.HEADER_ROW}`));
   const people = parseSheet(header, {...c, FIRST_DATA_ROW: String(Number(c.HEADER_ROW)+1)}).people;
   const target = validateEdit(input, c, people);
+  if (target.personnel) throw new Error('個人への割当は /api/allocation から操作してください。');
   const rowCells = (await getValues(env, sheetRef(c.SHEET_TAB, `A${target.row}:${c.PERSON_END_COLUMN}${target.row}`)))[0] || [];
   const currentName = normalizeCell(rowCells[1]);
   if (!currentName || currentName !== normalizeCell(input.expectedName)) throw new ConflictError('対象行が変更されています。再読み込みしてください。');
@@ -116,6 +117,62 @@ export async function editCell(env, input) {
   } catch (error) { warning = `変更は保存されましたが、履歴の記録に失敗しました: ${error.message}`; }
   return { changed:true, warning };
 }
+
+// Move items between the warehouse column G and the person's column in one
+// Sheets values.batchUpdate. Never edit formula columns F (active) or H (total).
+export async function allocateAsset(env, input) {
+  const c = cfg(env);
+  const sheetRow = Number(input.sheetRow);
+  if (!Number.isSafeInteger(sheetRow) || sheetRow < Number(c.FIRST_DATA_ROW) || sheetRow > Number(c.MAX_DATA_ROWS)) {
+    throw new Error('不正な行番号です。');
+  }
+  const column = String(input.personColumn || '').toUpperCase();
+  const start = colToIndex(c.PERSON_START_COLUMN);
+  const end = colToIndex(c.PERSON_END_COLUMN);
+  if (!/^[A-Z]+$/.test(column) || colToIndex(column) < start || colToIndex(column) > end) {
+    throw new Error('割当先の列が正しくありません。');
+  }
+  const ranges = [
+    sheetRef(c.SHEET_TAB, `A${c.HEADER_ROW}:${c.PERSON_END_COLUMN}${c.HEADER_ROW}`),
+    sheetRef(c.SHEET_TAB, `A${sheetRow}:${c.PERSON_END_COLUMN}${sheetRow}`)
+  ];
+  const query = new URLSearchParams({valueRenderOption:'FORMATTED_VALUE'});
+  for (const range of ranges) query.append('ranges',range);
+  const response = await request(env, `/values:batchGet?${query}`);
+  const header = response.valueRanges?.[0]?.values?.[0] || [];
+  const rowCells = response.valueRanges?.[1]?.values?.[0] || [];
+  const name = normalizeCell(rowCells[1]);
+  if (!name || name !== normalizeCell(input.expectedName)) {
+    throw new ConflictError('機材行が変更されています。最新の状態に更新してください。');
+  }
+  const personName = normalizeCell(header[colToIndex(column)-1]);
+  if (!personName || personName !== normalizeCell(input.expectedPersonName)) {
+    throw new ConflictError('担当者の列が変更されています。再読み込みしてください。');
+  }
+  const transfer = planAllocation({
+    currentAssigned:rowCells[colToIndex(column)-1],
+    currentSpares:rowCells[6],
+    expectedAssigned:input.expectedAssigned,
+    expectedSpares:input.expectedSpares,
+    delta:input.delta
+  });
+  await writeValues(env, [
+    {range:sheetRef(c.SHEET_TAB, `G${sheetRow}`),values:[[transfer.nextSpares]]},
+    {range:sheetRef(c.SHEET_TAB, `${column}${sheetRow}`),values:[[transfer.nextAssigned || '']]}
+  ], 'RAW');
+  let warning = '';
+  try {
+    await appendAudit(env, [
+      new Date().toISOString(),input.actor || '未指定',transfer.delta > 0 ? '貸出・割当' : '返却・在庫戻し',
+      String(sheetRow),name,personName,String(transfer.assigned),String(transfer.nextAssigned),
+      `備品数: ${transfer.spares} → ${transfer.nextSpares} / 移動数: ${Math.abs(transfer.delta)}`
+    ]);
+  } catch (err) {
+    warning = `割当数と備品数は保存されましたが、履歴記録に失敗しました: ${err.message}`;
+  }
+  return {changed:true,assigned:transfer.nextAssigned,spares:transfer.nextSpares,warning};
+}
+
 export async function createAsset(env, input) {
   const c = cfg(env);
   const name = normalizeCell(input.name);

@@ -71,3 +71,39 @@ export function validateEdit(input, cfg, people) {
   if (column === 'B' && !value) throw new Error('備品名は必須です。');
   return { row, column, value, personnel, label: EDITABLE_COLUMNS[column] || personnel?.name || '' };
 }
+
+// Inventory transfers must conserve the total (assigned + warehouse stock).
+// Both expected values are checked before any Google write to catch stale UIs.
+export function planAllocation({currentAssigned,currentSpares,expectedAssigned,expectedSpares,delta}) {
+  function integer(value, label) {
+    const raw = normalizeCell(value);
+    if (raw === '') return 0;
+    if (!/^(\d+|\d{1,3}(,\d{3})+)$/.test(raw)) throw new Error(`${label}は0以上の整数である必要があります。`);
+    const normalized = raw.replaceAll(',', '');
+    if (normalized.length > 5 || Number(normalized) > 99999) throw new Error(`${label}は99999以下である必要があります。`);
+    return Number(normalized);
+  }
+  const assigned = integer(currentAssigned,'割当数');
+  const spares = integer(currentSpares,'備品数');
+  const change = Number(delta);
+  if (!Number.isSafeInteger(change) || change === 0 || Math.abs(change) > 99999) throw new Error('変更数量は1以上の整数で指定してください。');
+  if (assigned !== integer(expectedAssigned,'画面の割当数') || spares !== integer(expectedSpares,'画面の備品数')) {
+    const err = new Error('他の操作で数量が更新されています。再読み込みしてからやり直してください。');
+    err.status = 409;
+    throw err;
+  }
+  if (change > spares) {
+    const err = new Error(`備品数が不足しています（現在 ${spares} 点）。`);
+    err.status = 409;
+    throw err;
+  }
+  if (change < -assigned) {
+    const err = new Error(`返却可能数を超えています（現在の割当 ${assigned} 点）。`);
+    err.status = 409;
+    throw err;
+  }
+  const nextAssigned = assigned + change;
+  const nextSpares = spares - change;
+  if (nextAssigned > 99999 || nextSpares > 99999) throw new Error('数量の上限（99999点）を超えています。');
+  return {assigned,spares,delta:change,nextAssigned,nextSpares};
+}
