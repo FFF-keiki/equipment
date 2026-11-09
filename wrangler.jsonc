@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "equipment-manager-sheets",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    "DEMO_MODE": "false",
+    // この値はスプレッドシート下部の「タブ名」です。URLの gid=0 ではありません。
+    // タブ名が「機材管理」でない場合は、実際の名前に書き換えてください。
+    "SHEET_TAB": "機材管理",
+    "HEADER_ROW": "2",
+    "FIRST_DATA_ROW": "3",
+    "PERSON_START_COLUMN": "K",
+    "PERSON_END_COLUMN": "BB",
+    "MAX_DATA_ROWS": "1000",
+    "AUDIT_TAB": "操作履歴"
+  }
+}
