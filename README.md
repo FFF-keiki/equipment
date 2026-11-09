@@ -86,20 +86,16 @@ Wrangler がローカル URL を表示します。ブラウザで開いてくだ
 "DEMO_MODE": "false"
 ```
 
-Cloudflare アカウントにログインし、**Secret** として値を登録します。
+Cloudflare アカウントにログインし、以下の実行時接続情報を登録します。`SPREADSHEET_ID`・`SERVICE_ACCOUNT_EMAIL` は変数でもよく、`SERVICE_ACCOUNT_PRIVATE_KEY` は **Secret** にしてください。
 
 ```bash
 npx wrangler login
 npx wrangler secret put SPREADSHEET_ID
 npx wrangler secret put SERVICE_ACCOUNT_EMAIL
 npx wrangler secret put SERVICE_ACCOUNT_PRIVATE_KEY
-npx wrangler secret put APP_PASSWORD
-npx wrangler secret put APP_SESSION_SECRET
 ```
 
 - `SERVICE_ACCOUNT_PRIVATE_KEY` は JSON の `private_key` に記載された PEM 文字列（`BEGIN PRIVATE KEY` から `END PRIVATE KEY` まで）を登録します。`\n` のままでも、実際の改行でも処理できます。
-- `APP_PASSWORD` は Webアプリへの共通ログインパスワード。十分長く設定してください。
-- `APP_SESSION_SECRET` はセッション署名用の**別のランダムな値**です。例：`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` で生成。
 - コマンドの入力をスクリプトや履歴に残したくない場合、Cloudflare ダッシュボードの Worker 設定 → Secrets から登録してください。
 
 デプロイ：
@@ -112,7 +108,7 @@ URLはデプロイ完了後に Wrangler が表示します。`wrangler.demo.json
 
 ### ローカルで本物のシートへ接続したい場合
 
-`.dev.vars.example` を `.dev.vars` にコピーし、5つの認証値を記入します（`.dev.vars` は Git 対象外）。`npm run build` の後 `npm run dev:live` で Worker を起動します。Vite からアクセスする場合は、別ターミナルで `npm run dev` を開始します。
+`.dev.vars.example` を `.dev.vars` にコピーし、3つの接続情報を記入します（`.dev.vars` は Git 対象外）。`npm run build` の後 `npm run dev:live` で Worker を起動します。Vite からアクセスする場合は、別ターミナルで `npm run dev` を開始します。
 
 ## 4. GitHub → Cloudflare 自動デプロイ
 
@@ -128,7 +124,7 @@ GitHub リポジトリの **Settings → Secrets and variables → Actions** に
 ## 注意点と次の拡張候補
 
 - **現物単位の管理ではありません。** 同じ型番の複数台をまとめて数量管理します。機材1台ずつのシリアル番号管理や故障/修理中ステータスは別設計が必要です。
-- 今回は共通パスワード認証で、「操作する人」をドロップダウン選択します。**本人確認ではない**ので、部署別の権限や操作責任を厳密に管理するなら Cloudflare Access / Googleログインの個人認証を追加してください。
+- ログイン画面はありません。**URLを開ける人なら誰でも閲覧・変更できます**。操作担当者のプルダウンは自己申告であり本人確認ではありません。公開する前に Cloudflare Access 等で事務所メンバーのみにアクセスを限定することを強く推奨します。
 - Sheets API へのアクセスは利用者の人数に応じて増えます。スタッフ数が多くなったらキャッシュや D1ミラー/Push 通知の設計を検討してください。
 - 新規機材追加時にコピーする数式が直前行に存在しない場合、追加行の自動計算値が空欄になる可能性があります。実際の式に応じて初期調整が必要です。
 - 元スプシに行を挿入・並べ替えしたときは、Webの保存前に再読込してください。アプリは行番号 + 機材名 + 旧セル値で競合を検知しますが、厳密な機材ID列の追加が将来の推奨事項です。
@@ -137,7 +133,7 @@ GitHub リポジトリの **Settings → Secrets and variables → Actions** に
 ## フォルダ
 
 ```
-src/worker.js         Cloudflare Worker API、ログイン認証
+src/worker.js         Cloudflare Worker API（アプリ内ログインなし）
 src/google.js         Sheets OAuth、読込、セル更新、行追加、履歴
 src/domain.js         列番号変換、データ変換、入力検証
 src/demo.js           ダミーデータ（本番には書き込まれません）
@@ -149,4 +145,3 @@ wrangler.demo.jsonc   Cloudflareデモ設定
 ```
 
 **現時点では画像だけを参照しているため、実際のスプシとの接続確認は行っていません。** スプレッドシートの URL / ファイルの実データを確認して、タブ名・見出し・式の配置を最終調整してください。
-再デプロイ用更新

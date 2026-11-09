@@ -31,3 +31,9 @@ vite.config.js
 スプレッドシートは、実際のタブ名と `wrangler.jsonc` の `SHEET_TAB` を一致させてください。
 
 **注意：** 本番シートの編集前にコピーしたシートで同期をテストしてください。
+
+## v0.1.2: ログイン画面なし
+
+- `APP_PASSWORD` / `APP_SESSION_SECRET` は不要です。Cloudflareに既存値があっても使用しません。
+- **URLを知る人は誰でも機材管理データを閲覧・編集できます**。一般公開は避け、必要に応じて Cloudflare Access で事務所のメンバーのみにアクセスを限定してください。
+- Google Sheetsの接続には `SPREADSHEET_ID`・`SERVICE_ACCOUNT_EMAIL`・`SERVICE_ACCOUNT_PRIVATE_KEY` の3つが必要です。

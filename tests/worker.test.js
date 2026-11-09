@@ -21,5 +21,13 @@ test('Production defaults to configuration required, not an unprotected demo',as
   const s=await call('/api/session','GET',null,'http://localhost:8787',{DEMO_MODE:'false',ASSETS:env.ASSETS});
   assert.equal(s.json.mode,'unconfigured');
   const state=await call('/api/snapshot','GET',null,'http://localhost:8787',{DEMO_MODE:'false',ASSETS:env.ASSETS});
-  assert.equal(state.status,401);
+  assert.equal(state.status,503);
+});
+
+test('Production session is accessible without APP_PASSWORD or APP_SESSION_SECRET',async()=>{
+  const e={DEMO_MODE:'false',ASSETS:env.ASSETS,SPREADSHEET_ID:'sheet',SERVICE_ACCOUNT_EMAIL:'service@example.iam.gserviceaccount.com',SERVICE_ACCOUNT_PRIVATE_KEY:'test-only-key'};
+  const s=await call('/api/session','GET',null,'http://localhost:8787',e);
+  assert.equal(s.status,200);assert.equal(s.json.mode,'live');assert.equal(s.json.authorized,true);
+  const oldLogin=await call('/api/login','POST',{password:'irrelevant'},'http://localhost:8787',e);
+  assert.equal(oldLogin.status,404);
 });
