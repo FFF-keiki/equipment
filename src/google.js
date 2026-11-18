@@ -46,7 +46,7 @@ function cfg(env) {
   return {
     SHEET_TAB: env.SHEET_TAB || '機材管理', HEADER_ROW: env.HEADER_ROW || '2',
     FIRST_DATA_ROW: env.FIRST_DATA_ROW || '3', PERSON_START_COLUMN: env.PERSON_START_COLUMN || 'K',
-    PERSON_END_COLUMN: env.PERSON_END_COLUMN || 'BB', MAX_DATA_ROWS: env.MAX_DATA_ROWS || '1000',
+    PERSON_END_COLUMN: env.PERSON_END_COLUMN || 'BL', MAX_DATA_ROWS: env.MAX_DATA_ROWS || '1000',
     AUDIT_TAB: env.AUDIT_TAB || '操作履歴'
   };
 }

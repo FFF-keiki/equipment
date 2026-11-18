@@ -2,8 +2,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "equipment-manager-sheets",
   "main": "src/worker.js",
-  "compatibility_date": "2026-11-01",
   "keep_vars": true,
+  "compatibility_date": "2026-11-01",
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
@@ -22,7 +22,7 @@
     "HEADER_ROW": "2",
     "FIRST_DATA_ROW": "3",
     "PERSON_START_COLUMN": "K",
-    "PERSON_END_COLUMN": "BB",
+    "PERSON_END_COLUMN": "BL",
     "MAX_DATA_ROWS": "1000",
     "AUDIT_TAB": "操作履歴"
   }

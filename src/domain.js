@@ -20,7 +20,7 @@ export function parseSheet(values, cfg) {
   const headerRow = Number(cfg.HEADER_ROW || 2);
   const firstRow = Number(cfg.FIRST_DATA_ROW || 3);
   const start = colToIndex(cfg.PERSON_START_COLUMN || 'K');
-  const end = colToIndex(cfg.PERSON_END_COLUMN || 'BB');
+  const end = colToIndex(cfg.PERSON_END_COLUMN || 'BL');
   const header = values[0] || [];
   const people = [];
   for (let idx = start; idx <= end; idx++) {

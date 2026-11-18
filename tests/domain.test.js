@@ -32,3 +32,18 @@ test('Formula columns F/H and invalid fields cannot be edited',()=>{
   assert.equal(validateEdit({column:'K',sheetRow:3,value:'2'},config,people).value,'2');
   assert.equal(validateEdit({column:'B',sheetRow:3,value:'新モニター'},config,people).value,'新モニター');
 });
+
+test('the expanded BL boundary includes staff beyond the former BB endpoint',()=>{
+  const header=Array(64).fill('');
+  header[1]='液タブ';
+  header[53]='BB担当';
+  header[63]='BL担当';
+  const row=Array(64).fill('');
+  row[1]='液タブ(金属)';
+  row[6]='2';
+  row[53]='1';
+  row[63]='2';
+  const actual=parseSheet([header,row],{HEADER_ROW:'2',FIRST_DATA_ROW:'3',PERSON_START_COLUMN:'K',PERSON_END_COLUMN:'BL'});
+  assert.equal(actual.people.at(-1).name,'BL担当');
+  assert.equal(actual.rows[0].allocations.BL,'2');
+});

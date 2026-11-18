@@ -9,6 +9,7 @@ import {
   UserRound, UsersRound, Warehouse, X
 } from 'lucide-react';
 import './style.css';
+import { allocationDelta } from './grid-edit.js';
 
 const FIELD_MAP={A:'category',B:'name',C:'model',D:'note',E:'updatedAt',G:'spares',I:'purchasedAt',J:'lifespan'};
 const FIELDS=[['A','カテゴリ'],['B','備品名'],['C','型番'],['D','備考'],['E','記載・更新日'],['G','備品数（保管分）'],['I','購入日'],['J','耐用年数']];
@@ -217,7 +218,7 @@ function App(){
         </div>
         <div className="segmented people-display-mode"><button className={peopleMode==='selected'?'on':''} onClick={()=>setPeopleMode('selected')}><UserRound size={15}/> 選択したスタッフ</button><button className={peopleMode==='all'?'on':''} onClick={()=>setPeopleMode('all')}><UsersRound size={15}/> 全員一覧</button></div>
       </div>
-      {peopleMode==='selected'&&selectedPerson?<PersonDetail person={selectedPerson} rows={rows} busy={busy} onChange={changeAllocation} onAssign={()=>setModal({kind:'allocate',personColumn:selectedPerson.column})}/>:peopleMode==='all'?<PeopleOverview rows={rows} people={availablePeople} query={personQuery} onQueryChange={setPersonQuery} onSelect={col=>{setPersonColumn(col);setPeopleMode('selected')}}/>:<Blank icon={UsersRound} title="担当者が登録されていません" description="スプシの2行目、K列以降の見出しを確認してください。"/>}
+      {peopleMode==='selected'&&selectedPerson?<PersonDetail person={selectedPerson} rows={rows} busy={busy} onChange={changeAllocation} onAssign={()=>setModal({kind:'allocate',personColumn:selectedPerson.column})}/>:peopleMode==='all'?<PeopleOverview rows={rows} people={availablePeople} query={personQuery} onQueryChange={setPersonQuery} onSelect={col=>{setPersonColumn(col);setPeopleMode('selected')}} onChange={changeAllocation} onError={message=>notify(message,'err')} busy={busy}/>:<Blank icon={UsersRound} title="担当者が登録されていません" description="スプシの2行目、K列以降の見出しを確認してください。"/>}
     </>}
     {page==='history'&&<><div className="history-heading"><div><h3>操作ログ</h3><p>Webで行った編集・割当操作を表示します。スプシで直接編集した操作はGoogle側の変更履歴で確認してください。</p></div><Pill>最新 {history.length} 件</Pill></div><div className="history-list">{history.length?history.map((h,i)=><div className="history-row" key={i}><span className="history-bullet"><History size={17}/></span><div className="history-main"><div><strong>{h.asset}</strong><span className="history-action">{h.action}</span></div><p>{h.person?`${h.person} · `:''}{h.before||'空欄'} <ArrowRight size={13}/> {h.after||'空欄'}</p></div><div className="history-meta"><strong>{h.actor||'未指定'}</strong><small>{dateTime(h.time)}</small></div></div>):<Blank icon={History} title="変更履歴はまだありません" description="Webで編集すると、操作内容が記録されます。"/>}</div></>}
     <footer className="content-footer"><span><span className={'status-dot'+(lastError?' offline':'')}/> {session.mode==='demo'?'デモデータ':'Google Sheetsと接続'} · {data?.syncedAt?`最終取得 ${dateTime(data.syncedAt)}`:'未取得'}</span><span>変更通知で更新 · 定期取得なし · 手動更新可能</span></footer>
@@ -261,13 +262,91 @@ function PersonDetail({person,rows,busy,onChange,onAssign}){
     </section>
   </div>
 }
-function PeopleOverview({rows,people,query,onQueryChange,onSelect}){
-  const results=people.filter(p=>p.name.toLowerCase().includes(query.toLowerCase()));
-  return <section className="roster-panel"><div className="roster-top"><div><h3>全員の機材使用状況</h3><p>使用機材を一覧で比較できます。スタッフを選択すると割当・返却ができます。</p></div><div className="search small-search"><Search size={16}/><input value={query} onChange={e=>onQueryChange(e.target.value)} placeholder="スタッフを検索"/></div></div><div className="roster-rows">
-    {results.map(p=>{const assigned=rows.filter(r=>itemCount(r,p)>0);const total=assigned.reduce((n,r)=>n+itemCount(r,p),0);return <button type="button" key={p.column} className="roster-row" onClick={()=>onSelect(p.column)}><span className="roster-identity"><span className="person-initial">{p.name.slice(0,1)}</span><strong>{p.name}</strong></span><span className="roster-chips">{assigned.slice(0,6).map(r=><span className="roster-chip" key={r.sheetRow}>{r.name} <b>×{itemCount(r,p)}</b></span>)}{assigned.length>6&&<span className="roster-more">ほか {assigned.length-6} 種類</span>}{!assigned.length&&<span className="muted">割当なし</span>}</span><span className="roster-totals">{assigned.length} 種類 <b>{total} 点</b></span><ChevronRight size={17}/></button>})}
-    {!results.length&&<Blank icon={Search} title="スタッフが見つかりません" description="検索条件を変更してください。"/>}
-  </div></section>
+function PeopleOverview({rows,people,query,onQueryChange,onSelect,onChange,onError,busy}){
+  const [equipmentQuery,setEquipmentQuery]=useState('');
+  const [onlyAssigned,setOnlyAssigned]=useState(false);
+  const [pageSize,setPageSize]=useState(100);
+  const [pageNumber,setPageNumber]=useState(0);
+  const [editor,setEditor]=useState(null);
+  const inputRef=useRef(null);
+  const skipBlurRef=useRef(false);
+  const visiblePeople=useMemo(()=>people.filter(p=>p.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())),[people,query]);
+  const matchedRows=useMemo(()=>rows.filter(r=>{
+    const matches=[r.category,r.name,r.model,r.note].join(' ').toLocaleLowerCase().includes(equipmentQuery.trim().toLocaleLowerCase());
+    return matches && (!onlyAssigned||visiblePeople.some(p=>itemCount(r,p)>0));
+  }),[rows,equipmentQuery,onlyAssigned,visiblePeople]);
+  useEffect(()=>setPageNumber(0),[query,equipmentQuery,onlyAssigned,pageSize]);
+  const pageCount=pageSize===0?1:Math.max(1,Math.ceil(matchedRows.length/pageSize));
+  const safePage=Math.min(pageNumber,pageCount-1);
+  const visibleRows=pageSize===0?matchedRows:matchedRows.slice(safePage*pageSize,(safePage+1)*pageSize);
+  useEffect(()=>{
+    if(editor&&inputRef.current){inputRef.current.focus();inputRef.current.select()}
+  },[editor?.sheetRow,editor?.column]);
+  const openEditor=(r,p)=>{
+    if(busy)return;
+    skipBlurRef.current=false;
+    setEditor({sheetRow:r.sheetRow,column:p.column,value:String(itemCount(r,p))});
+  };
+  const commit=(r,p,raw)=>{
+    if(!editor||editor.sheetRow!==r.sheetRow||editor.column!==p.column)return;
+    if(skipBlurRef.current){skipBlurRef.current=false;setEditor(null);return;}
+    setEditor(null);
+    let delta;
+    try{delta=allocationDelta(itemCount(r,p),raw)}catch(error){onError(error.message);return;}
+    if(delta===0)return;
+    if(delta>count(r.spares)){onError(`備品数が不足しています（残り${count(r.spares)}点）。`);return;}
+    onChange(r,p,delta);
+  };
+  const editKey=(event,r,p)=>{
+    if(event.key==='Enter'){event.preventDefault();event.currentTarget.blur()}
+    if(event.key==='Escape'){event.preventDefault();skipBlurRef.current=true;setEditor(null)}
+  };
+  return <section className="matrix-panel" aria-label="全員の機材割当表">
+    <div className="matrix-top">
+      <div><h3>全員の機材使用状況</h3><p>スプレッドシートと同じ行・列形式です。セルをクリックして数量を入力できます。</p></div>
+      <span className="matrix-count">機材 {matchedRows.length} 件 ・ スタッフ {visiblePeople.length} 名</span>
+    </div>
+    <div className="matrix-filters">
+      <div className="search matrix-search"><Search size={16}/><input aria-label="機材を絞り込み" placeholder="機材名・型番・カテゴリで検索" value={equipmentQuery} onChange={e=>setEquipmentQuery(e.target.value)}/>{equipmentQuery&&<button type="button" aria-label="機材検索をクリア" onClick={()=>setEquipmentQuery('')}><X size={14}/></button>}</div>
+      <div className="search matrix-search"><UsersRound size={16}/><input aria-label="スタッフを絞り込み" placeholder="スタッフ名で列を絞る" value={query} onChange={e=>onQueryChange(e.target.value)}/>{query&&<button type="button" aria-label="スタッフ検索をクリア" onClick={()=>onQueryChange('')}><X size={14}/></button>}</div>
+      <label className="matrix-check"><input type="checkbox" checked={onlyAssigned} onChange={e=>setOnlyAssigned(e.target.checked)}/> 割当のある機材だけ</label>
+      <label className="matrix-page-size">表示行数 <select value={pageSize} onChange={e=>setPageSize(Number(e.target.value))}><option value={50}>50</option><option value={100}>100</option><option value={200}>200</option><option value={0}>すべて</option></select></label>
+    </div>
+    <div className="matrix-tip"><ShieldCheck size={15}/> <span>空欄は0点です。クリックして数量を入力、Enter / セル外クリックで保存、Escでキャンセル。<strong>貸出時は備品数が減り、返却時は増えます。</strong></span></div>
+    <div className="matrix-scroll" role="region" tabIndex={0} aria-label="横スクロールできる機材・スタッフ割当表">
+      <table className="matrix-table"><thead><tr>
+        <th className="matrix-col-index" scope="col">行</th>
+        <th className="matrix-col-category" scope="col">カテゴリ</th>
+        <th className="matrix-col-asset" scope="col">備品名・型番</th>
+        <th className="matrix-count-col" scope="col">稼働</th>
+        <th className="matrix-count-col matrix-stock-head" scope="col">備品</th>
+        <th className="matrix-count-col" scope="col">総数</th>
+        {visiblePeople.map(person=><th key={person.column} className="matrix-person-col" scope="col"><button type="button" className="matrix-person-name" title={`${person.name}さんの詳細を表示`} onClick={()=>onSelect(person.column)}>{person.name}</button><span className="matrix-column-code">{person.column}</span></th>)}
+      </tr></thead><tbody>
+        {visibleRows.map(r=><tr key={r.sheetRow}>
+          <th className="matrix-col-index matrix-row-number" scope="row">{r.sheetRow}</th>
+          <td className="matrix-col-category matrix-cat-text" title={r.category}>{r.category||'—'}</td>
+          <th className="matrix-col-asset matrix-asset-label" title={`${r.name}${r.model?' / '+r.model:''}`} scope="row"><strong>{r.name}</strong>{r.model&&<small>{r.model}</small>}</th>
+          <td className="matrix-count-col matrix-readonly">{fmt(count(r.active))}</td>
+          <td className={'matrix-count-col matrix-stock'+(count(r.spares)===0?' matrix-empty-stock':'')}>{fmt(count(r.spares))}</td>
+          <td className="matrix-count-col matrix-readonly">{fmt(count(r.total))}</td>
+          {visiblePeople.map(person=>{
+            const n=itemCount(r,person);
+            const editing=editor?.sheetRow===r.sheetRow&&editor?.column===person.column;
+            return <td key={person.column} className={'matrix-quantity-cell'+(n>0?' matrix-assigned':'')+(editing?' matrix-cell-editing':'')}>
+              {editing?<input ref={inputRef} className="matrix-input" type="number" inputMode="numeric" min="0" max="99999" step="1" aria-label={`${r.name}／${person.name}の割当数を編集`} defaultValue={editor.value} onKeyDown={e=>editKey(e,r,person)} onBlur={e=>commit(r,person,e.currentTarget.value)} disabled={busy}/>:
+              <button type="button" className={'matrix-qty-button'+(n>0?' has-quantity':'')} onClick={()=>openEditor(r,person)} disabled={busy} title={`${r.name} / ${person.name}: ${n}点（備品 ${count(r.spares)}点）。クリックして編集`} aria-label={`${r.name}、${person.name}の使用数 ${n}点。クリックして編集`}>{n>0?n:''}</button>}
+            </td>;
+          })}
+        </tr>)}
+      </tbody></table>
+      {!visibleRows.length&&<div className="matrix-empty"><Blank icon={Search} title="該当する機材がありません" description="検索条件を変更してください。"/></div>}
+    </div>
+    {pageSize!==0&&pageCount>1&&<div className="matrix-pagination"><span>{safePage*pageSize+1}〜{Math.min((safePage+1)*pageSize,matchedRows.length)} 件 / {matchedRows.length} 件</span><div><button type="button" disabled={safePage===0||busy} onClick={()=>setPageNumber(v=>Math.max(0,v-1))}>前へ</button><strong>{safePage+1} / {pageCount}</strong><button type="button" disabled={safePage>=pageCount-1||busy} onClick={()=>setPageNumber(v=>Math.min(pageCount-1,v+1))}>次へ</button></div></div>}
+    <p className="matrix-footnote">変更は確定時だけスプシへ送信します。稼働・総数はスプシの計算結果です。スタッフ名をクリックすると個人別の詳細に移動できます。</p>
+  </section>;
 }
+
 function AssignToPersonModal({person,rows,busy,onClose,onSubmit}){
   const inStock=rows.filter(r=>count(r.spares)>0);
   const [filter,setFilter]=useState('');
