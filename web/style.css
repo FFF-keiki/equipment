@@ -95,3 +95,17 @@
  .allocation-preview{padding:12px;gap:5px}
  .allocation-preview strong{font-size:14px}
 }
+
+/* v0.1.5: Make the full equipment table row an edit target. */
+.asset-table tbody tr.asset-row-clickable {
+  cursor: pointer;
+  transition: background-color .15s ease;
+}
+.asset-table tbody tr.asset-row-clickable:hover {
+  background-color: #eef5ff;
+}
+.asset-table tbody tr.asset-row-clickable:focus-visible {
+  outline: 2px solid #4f82df;
+  outline-offset: -2px;
+  background-color: #edf4ff;
+}
